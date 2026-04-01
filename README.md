@@ -32,8 +32,8 @@ Click "Run anyway"
 We're working on obtaining a code-signing certificate for future releases.
 
 🌐 Website
-Visit auto-loop-magic.lovable.app for more info.
+Visit https://myloopio.com for more info.
 
 📄 License
-See LICENSE for details.
+see [LICENSE] (License.md) for details.
 
