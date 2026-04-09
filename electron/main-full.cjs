@@ -5,7 +5,6 @@ const crypto = require('crypto'); // used for deviceId generation
 
 const POLAR_API_URL = 'https://api.polar.sh/v1/customer-portal/license-keys/validate';
 const POLAR_ORGANIZATION_ID = '80044d27-df19-48a9-af9f-466d4df38207';
-const POLAR_BENEFIT_ID = 'daf0d275-4dc2-4546-9767-ea8dd516a0c8';
 
 function getLicenseFilePath() {
   return path.join(app.getPath('userData'), 'license.json');
@@ -78,8 +77,6 @@ async function validateLicenseOnline(licenseKey) {
       body: JSON.stringify({
         key,
         organization_id: POLAR_ORGANIZATION_ID,
-        benefit_id: POLAR_BENEFIT_ID,
-        activation_label: deviceId,
       }),
     });
 
