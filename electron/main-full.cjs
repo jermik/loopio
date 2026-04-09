@@ -1,9 +1,11 @@
 const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
+const crypto = require('crypto'); // used for deviceId generation
 
-const PUBLIC_KEY_PATH = path.join(__dirname, '..', 'build', 'license-public.pem');
+const POLAR_API_URL = 'https://api.polar.sh/v1/customer-portal/license-keys/validate';
+const POLAR_ORGANIZATION_ID = '80044d27-df19-48a9-af9f-466d4df38207';
+const POLAR_BENEFIT_ID = 'daf0d275-4dc2-4546-9767-ea8dd516a0c8';
 
 function getLicenseFilePath() {
   return path.join(app.getPath('userData'), 'license.json');
@@ -63,44 +65,39 @@ function getStoredLicenseStatus() {
   };
 }
 
-function fromBase64Url(str) {
-  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
-}
-
-function validateLicenseOnline(licenseKey) {
+async function validateLicenseOnline(licenseKey) {
   const key = String(licenseKey || '').trim();
   if (!key) return { valid: false, message: 'License key is required.' };
 
-  const parts = key.split('.');
-  if (parts.length !== 3 || parts[0] !== 'ML1') {
-    return { valid: false, message: 'Invalid license key format.' };
-  }
-
-  const [, payloadB64, signatureB64] = parts;
+  const deviceId = getOrCreateDeviceId();
 
   try {
-    const publicKey = fs.readFileSync(PUBLIC_KEY_PATH, 'utf-8');
-    const verify = crypto.createVerify('RSA-SHA256');
-    verify.update(payloadB64);
-    verify.end();
-    const valid = verify.verify(publicKey, fromBase64Url(signatureB64));
+    const response = await fetch(POLAR_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        key,
+        organization_id: POLAR_ORGANIZATION_ID,
+        benefit_id: POLAR_BENEFIT_ID,
+        activation_label: deviceId,
+      }),
+    });
 
-    if (!valid) return { valid: false, message: 'Invalid license key.' };
+    const data = await response.json().catch(() => null);
 
-    const payload = JSON.parse(fromBase64Url(payloadB64).toString('utf-8'));
-
-    if (payload.product !== 'myloopio-full') {
-      return { valid: false, message: 'License is not valid for this product.' };
+    if (response.ok && data?.status === 'granted') {
+      return {
+        valid: true,
+        licensee: data.customer?.email || 'Licensed user',
+        issuedAt: data.created_at || null,
+        message: 'License activated successfully.',
+      };
     }
 
-    return {
-      valid: true,
-      licensee: payload.licensee || 'Licensed user',
-      issuedAt: payload.issuedAt || null,
-      message: 'License activated successfully.',
-    };
+    const reason = data?.detail || data?.status || 'Invalid license key.';
+    return { valid: false, message: String(reason) };
   } catch {
-    return { valid: false, message: 'Invalid license key.' };
+    return { valid: false, message: 'Could not reach the license server. Check your internet connection.' };
   }
 }
 
@@ -943,8 +940,8 @@ app.whenReady().then(() => {
   ipcMain.on('close-app', () => { if (win) win.close(); });
   ipcMain.handle('get-build-info', () => ({ variant: 'full' }));
   ipcMain.handle('license-status', () => getStoredLicenseStatus());
-  ipcMain.handle('activate-license', (_event, licenseKey) => {
-    const result = validateLicenseOnline(licenseKey);
+  ipcMain.handle('activate-license', async (_event, licenseKey) => {
+    const result = await validateLicenseOnline(licenseKey);
     if (result.valid) {
       saveActivatedLicense(String(licenseKey || '').trim(), {
         licensee: result.licensee || 'Licensed user',

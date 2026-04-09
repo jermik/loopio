@@ -2,117 +2,107 @@ const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electro
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 
-// --- TRIAL MODE ---
-const IS_TRIAL = true;
-const TRIAL_LIMIT_SECONDS = 3600; // 60 minutes
-const TRIAL_SYNC_INTERVAL = 15000; // sync every 15 seconds while playing
-const TRIAL_RPC_LIMIT = TRIAL_LIMIT_SECONDS;
+const PUBLIC_KEY_PATH = path.join(__dirname, '..', 'build', 'license-public.pem');
 
-function getTrialPath() {
-  return path.join(app.getPath('appData'), 'MyLoopio', 'trial.json');
+function getLicenseFilePath() {
+  return path.join(app.getPath('userData'), 'license.json');
 }
 
-function readTrialData() {
+function getDeviceFilePath() {
+  return path.join(app.getPath('userData'), 'device.json');
+}
+
+function ensureAppDataDir() {
+  const dir = app.getPath('userData');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function readJson(filePath) {
   try {
-    const p = getTrialPath();
-    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf-8'));
-  } catch {}
-  return null;
-}
-
-function writeTrialData(data) {
-  try {
-    const dir = path.join(app.getPath('appData'), 'MyLoopio');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(getTrialPath(), JSON.stringify(data, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('[Trial] Failed to write trial data:', e);
-  }
-}
-
-function parseEnvFile(content) {
-  const env = {};
-  for (const rawLine of content.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith('#')) continue;
-    const idx = line.indexOf('=');
-    if (idx === -1) continue;
-    const key = line.slice(0, idx).trim();
-    let value = line.slice(idx + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
-    }
-    env[key] = value;
-  }
-  return env;
-}
-
-function readRuntimeEnv() {
-  const candidates = [
-    path.join(app.getAppPath(), '.env.production'),
-    path.join(app.getAppPath(), '.env'),
-    path.join(process.cwd(), '.env.production'),
-    path.join(process.cwd(), '.env'),
-  ];
-  const out = { ...process.env };
-  for (const candidate of candidates) {
-    try {
-      if (fs.existsSync(candidate)) Object.assign(out, parseEnvFile(fs.readFileSync(candidate, 'utf-8')));
-    } catch {}
-  }
-  return out;
-}
-
-function sha(input) {
-  return crypto.createHash('sha256').update(String(input)).digest('hex');
-}
-
-function getWindowsMachineGuid() {
-  try {
-    const stdout = execFileSync('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], {
-      encoding: 'utf8',
-      windowsHide: true,
-    });
-    const match = stdout.match(/MachineGuid\s+REG_\w+\s+([^\r\n]+)/i);
-    return match?.[1]?.trim() || null;
+    if (!fs.existsSync(filePath)) return null;
+    return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
   } catch {
     return null;
   }
 }
 
-function getDeviceId() {
-  const raw = [
-    getWindowsMachineGuid(),
-    process.env.COMPUTERNAME,
-    process.env.USERNAME,
-    process.arch,
-    process.platform,
-  ].filter(Boolean).join('|');
-  return sha(`myloopio-trial-v4|${raw || 'unknown-device'}`);
+function writeJson(filePath, value) {
+  ensureAppDataDir();
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf-8');
 }
 
-function getMachineName() {
-  return process.env.COMPUTERNAME || process.env.HOSTNAME || 'unknown-machine';
+function getOrCreateDeviceId() {
+  const saved = readJson(getDeviceFilePath());
+  if (saved?.deviceId) return saved.deviceId;
+  const deviceId = crypto.randomUUID();
+  writeJson(getDeviceFilePath(), { deviceId, createdAt: new Date().toISOString() });
+  return deviceId;
 }
 
-let trialData = null;
-let trialState = {
-  mode: 'local',
-  initialized: false,
-  deviceId: null,
-  usedSeconds: 0,
-  remainingSeconds: TRIAL_LIMIT_SECONDS,
-  limitSeconds: TRIAL_LIMIT_SECONDS,
-  isExpired: false,
-  pendingIncrement: 0,
-  lastSyncedAt: null,
-  lastError: null,
-};
-let trialTickTimer = null;
-let trialSyncTimer = null;
-let trialLastTickAt = 0;
+function saveActivatedLicense(licenseKey, meta = {}) {
+  writeJson(getLicenseFilePath(), {
+    licenseKey,
+    activatedAt: new Date().toISOString(),
+    ...meta,
+  });
+}
+
+function readActivatedLicense() {
+  return readJson(getLicenseFilePath());
+}
+
+function getStoredLicenseStatus() {
+  const saved = readActivatedLicense();
+  if (!saved?.licenseKey) return { valid: false, message: 'No license activated on this device.' };
+  return {
+    valid: true,
+    licensee: saved.licensee || 'Licensed user',
+    issuedAt: saved.issuedAt || saved.activatedAt || null,
+    message: 'Activated on this device.',
+  };
+}
+
+function fromBase64Url(str) {
+  return Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+}
+
+function validateLicenseOnline(licenseKey) {
+  const key = String(licenseKey || '').trim();
+  if (!key) return { valid: false, message: 'License key is required.' };
+
+  const parts = key.split('.');
+  if (parts.length !== 3 || parts[0] !== 'ML1') {
+    return { valid: false, message: 'Invalid license key format.' };
+  }
+
+  const [, payloadB64, signatureB64] = parts;
+
+  try {
+    const publicKey = fs.readFileSync(PUBLIC_KEY_PATH, 'utf-8');
+    const verify = crypto.createVerify('RSA-SHA256');
+    verify.update(payloadB64);
+    verify.end();
+    const valid = verify.verify(publicKey, fromBase64Url(signatureB64));
+
+    if (!valid) return { valid: false, message: 'Invalid license key.' };
+
+    const payload = JSON.parse(fromBase64Url(payloadB64).toString('utf-8'));
+
+    if (payload.product !== 'myloopio-full') {
+      return { valid: false, message: 'License is not valid for this product.' };
+    }
+
+    return {
+      valid: true,
+      licensee: payload.licensee || 'Licensed user',
+      issuedAt: payload.issuedAt || null,
+      message: 'License activated successfully.',
+    };
+  } catch {
+    return { valid: false, message: 'Invalid license key.' };
+  }
+}
 
 let win = null;
 let recording = false;
@@ -208,6 +198,18 @@ function registerGlobalHotkeys() {
       log('HOTKEY', `Failed to register ${accel}:`, err.message);
     }
   }
+}
+
+function applyCompactWindowMode(expanded = false) {
+  if (!win) return;
+  if (win.isMaximized()) win.unmaximize();
+  const bounds = win.getBounds();
+  const h = expanded ? 250 : 50;
+  win.setMinimumSize(280, 40);
+  win.setMaximumSize(400, expanded ? 350 : 50);
+  win.setResizable(false);
+  win.setAlwaysOnTop(true);
+  win.setBounds({ x: bounds.x, y: bounds.y, width: Math.max(bounds.width, 280), height: h });
 }
 
 // --- Script Library ---
@@ -582,13 +584,10 @@ function stopRecording() {
   if (win) win.webContents.send('action-count', recordedActions.length);
 }
 
-async function startPlayback() {
+function startPlayback() {
   if (recordedActions.length === 0) { log('PLAY', 'No actions to play'); return; }
   if (playing) return;
-  if (IS_TRIAL && !trialState.initialized) await initializeTrialLock();
-  if (IS_TRIAL && trialState.isExpired) { handleTrialExpired(); return; }
   playing = true;
-  startTrialConsumption();
   playbackAbortFlag = false;
   currentRepeat = 0;
   log('PLAY', 'Starting playback,', recordedActions.length, 'actions, speed:', playbackSpeed);
@@ -765,7 +764,6 @@ function stopPlayback() {
   log('PLAY', 'Stopping playback');
   playbackAbortFlag = true; // instant abort signal
   playing = false;
-  stopTrialConsumption();
   if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
   if (win) win.webContents.send('repeat-status', null);
   if (win) win.webContents.send('state-changed', 'idle');
@@ -800,236 +798,35 @@ function loadRecording() {
   }
 }
 
+
 function setWindowExpanded(expanded) {
-  if (!win) return;
-  const bounds = win.getBounds();
-  const h = expanded ? 250 : 50;
-  win.setMinimumSize(280, 40);
-  win.setMaximumSize(400, expanded ? 350 : 50);
-  win.setBounds({ x: bounds.x, y: bounds.y, width: Math.max(bounds.width, 280), height: h });
-}
-
-
-function buildTrialStatusPayload() {
-  return {
-    mode: trialState.mode,
-    initialized: trialState.initialized,
-    deviceId: trialState.deviceId,
-    usedSeconds: Math.max(0, Math.floor(trialState.usedSeconds || 0)),
-    remainingSeconds: Math.max(0, Math.floor(trialState.remainingSeconds || 0)),
-    limitSeconds: Math.max(0, Math.floor(trialState.limitSeconds || TRIAL_LIMIT_SECONDS)),
-    isExpired: !!trialState.isExpired,
-    lastSyncedAt: trialState.lastSyncedAt,
-    lastError: trialState.lastError || null,
-  };
-}
-
-function sendTrialStatus() {
-  if (!win) return;
-  win.webContents.send('trial-status', buildTrialStatusPayload());
-}
-
-async function callTrialRpc(functionName, body) {
-  const env = readRuntimeEnv();
-  const supabaseUrl = env.VITE_SUPABASE_URL || env.SUPABASE_URL;
-  const supabaseAnonKey = env.VITE_SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY;
-  if (!supabaseUrl || !supabaseAnonKey) {
-    throw new Error('Supabase env ontbreekt');
-  }
-  const endpoint = `${supabaseUrl.replace(/\/$/, '')}/rest/v1/rpc/${functionName}`;
-  const response = await fetch(endpoint, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      apikey: supabaseAnonKey,
-      Authorization: `Bearer ${supabaseAnonKey}`,
-      Prefer: 'return=representation',
-    },
-    body: JSON.stringify(body),
-  });
-  const responseText = await response.text();
-  if (!response.ok) throw new Error(responseText || `RPC ${functionName} failed (${response.status})`);
-  const json = responseText ? JSON.parse(responseText) : null;
-  return Array.isArray(json) ? json[0] : json;
-}
-
-function applyRemoteTrialState(payload) {
-  if (!payload) return;
-  trialState.mode = 'remote';
-  trialState.initialized = true;
-  trialState.usedSeconds = Math.max(0, Number(payload.used_seconds ?? payload.usedSeconds ?? 0));
-  trialState.limitSeconds = Math.max(1, Number(payload.limit_seconds ?? payload.limitSeconds ?? TRIAL_LIMIT_SECONDS));
-  trialState.remainingSeconds = Math.max(0, Number(payload.remaining_seconds ?? payload.remainingSeconds ?? (trialState.limitSeconds - trialState.usedSeconds)));
-  trialState.isExpired = !!(payload.is_expired ?? payload.isExpired ?? trialState.remainingSeconds <= 0);
-  trialState.lastSyncedAt = new Date().toISOString();
-  trialState.lastError = null;
-  sendTrialStatus();
-}
-
-function applyLocalTrialState() {
-  trialState.mode = 'local';
-  trialState.initialized = true;
-  trialState.usedSeconds = Math.max(0, Number(trialData?.usedTime || 0));
-  trialState.limitSeconds = TRIAL_LIMIT_SECONDS;
-  trialState.remainingSeconds = Math.max(0, TRIAL_LIMIT_SECONDS - trialState.usedSeconds);
-  trialState.isExpired = trialState.remainingSeconds <= 0;
-  sendTrialStatus();
-}
-
-async function ensureRemoteTrialState() {
-  const payload = await callTrialRpc('ensure_trial_lock', {
-    p_device_id: trialState.deviceId,
-    p_machine_name: getMachineName(),
-    p_app_version: app.getVersion(),
-    p_limit_seconds: TRIAL_RPC_LIMIT,
-  });
-  applyRemoteTrialState(payload);
-}
-
-async function consumeRemoteTrialSeconds(increment) {
-  const safeIncrement = Math.max(0, Math.floor(increment || 0));
-  if (safeIncrement <= 0) return buildTrialStatusPayload();
-  const payload = await callTrialRpc('consume_trial_seconds', {
-    p_device_id: trialState.deviceId,
-    p_increment: safeIncrement,
-    p_machine_name: getMachineName(),
-    p_app_version: app.getVersion(),
-    p_limit_seconds: TRIAL_RPC_LIMIT,
-  });
-  applyRemoteTrialState(payload);
-  return buildTrialStatusPayload();
-}
-
-async function flushPendingTrialUsage() {
-  if (trialState.mode === 'remote') {
-    const pending = trialState.pendingIncrement;
-    if (pending <= 0) return;
-    trialState.pendingIncrement = 0;
-    try {
-      await consumeRemoteTrialSeconds(pending);
-    } catch (error) {
-      trialState.pendingIncrement += pending;
-      trialState.lastError = error?.message || String(error);
-      sendTrialStatus();
-      log('TRIAL', 'Remote sync failed:', trialState.lastError);
-    }
-    return;
-  }
-
-  if (trialState.mode === 'local') {
-    trialData = trialData || { firstRun: Date.now(), usedTime: 0 };
-    trialData.usedTime = Math.max(trialData.usedTime || 0, trialState.usedSeconds);
-    writeTrialData(trialData);
-  }
-}
-
-function handleTrialExpired() {
-  stopTrialConsumption();
-  if (playing) stopPlayback();
-  if (win) {
-    dialog.showMessageBox(win, {
-      type: 'warning',
-      title: 'Trial Expired',
-      message: 'Your 60-minute MyLoopio trial has expired. Please purchase a license to continue.',
-      buttons: ['OK']
-    }).then(() => app.quit());
-  } else {
-    app.quit();
-  }
-}
-
-function updateLocalTrialUsage(increment) {
-  const safeIncrement = Math.max(0, Math.floor(increment || 0));
-  if (safeIncrement <= 0) return;
-  trialData = trialData || { firstRun: Date.now(), usedTime: 0 };
-  trialData.usedTime = Math.max(0, Number(trialData.usedTime || 0)) + safeIncrement;
-  trialState.usedSeconds = trialData.usedTime;
-  trialState.remainingSeconds = Math.max(0, TRIAL_LIMIT_SECONDS - trialState.usedSeconds);
-  trialState.isExpired = trialState.remainingSeconds <= 0;
-  writeTrialData(trialData);
-  sendTrialStatus();
-}
-
-function stopTrialConsumption() {
-  if (trialTickTimer) {
-    clearInterval(trialTickTimer);
-    trialTickTimer = null;
-  }
-  if (trialSyncTimer) {
-    clearInterval(trialSyncTimer);
-    trialSyncTimer = null;
-  }
-  trialLastTickAt = 0;
-  flushPendingTrialUsage().catch(() => {});
-}
-
-function startTrialConsumption() {
-  if (!IS_TRIAL || trialState.isExpired || trialTickTimer) return;
-  trialLastTickAt = Date.now();
-  trialTickTimer = setInterval(() => {
-    const now = Date.now();
-    const delta = Math.floor((now - trialLastTickAt) / 1000);
-    if (delta <= 0) return;
-    trialLastTickAt += delta * 1000;
-    trialState.usedSeconds += delta;
-    trialState.remainingSeconds = Math.max(0, trialState.limitSeconds - trialState.usedSeconds);
-    trialState.isExpired = trialState.remainingSeconds <= 0;
-    if (trialState.mode === 'remote') {
-      trialState.pendingIncrement += delta;
-    } else {
-      updateLocalTrialUsage(delta);
-    }
-    sendTrialStatus();
-    if (trialState.isExpired) handleTrialExpired();
-  }, 1000);
-
-  if (trialState.mode === 'remote') {
-    trialSyncTimer = setInterval(() => {
-      flushPendingTrialUsage().catch(() => {});
-    }, TRIAL_SYNC_INTERVAL);
-  }
-}
-
-async function initializeTrialLock() {
-  if (!IS_TRIAL) return;
-  trialState.deviceId = getDeviceId();
-  try {
-    await ensureRemoteTrialState();
-    log('TRIAL', 'Supabase trial lock active for device', trialState.deviceId.slice(0, 12));
-  } catch (error) {
-    trialState.lastError = error?.message || String(error);
-    log('TRIAL', 'Falling back to local trial lock:', trialState.lastError);
-    trialData = readTrialData();
-    if (!trialData) {
-      trialData = { firstRun: Date.now(), usedTime: 0 };
-      writeTrialData(trialData);
-    }
-    applyLocalTrialState();
-  }
-
-  if (trialState.isExpired) {
-    dialog.showMessageBoxSync({
-      type: 'warning',
-      title: 'Trial Expired',
-      message: 'Your 60-minute MyLoopio trial has expired. Please purchase a license to continue.',
-      buttons: ['OK']
-    });
-    app.quit();
-  }
+  applyCompactWindowMode(expanded);
 }
 
 function createWindow() {
+  const hasLicense = getStoredLicenseStatus().valid;
   win = new BrowserWindow({
-    width: 280, height: 50, minWidth: 280, minHeight: 40, maxHeight: 50,
+    width: hasLicense ? 280 : 720,
+    height: hasLicense ? 50 : 640,
+    minWidth: hasLicense ? 280 : 520,
+    minHeight: hasLicense ? 40 : 520,
+    maxHeight: hasLicense ? 50 : undefined,
     title: 'MyLoopio',
     icon: path.join(__dirname, '..', 'public', 'favicon.ico'),
     webPreferences: { contextIsolation: true, nodeIntegration: false, webSecurity: false, preload: path.join(__dirname, 'preload.cjs') },
     backgroundColor: '#0f1318',
-    autoHideMenuBar: true, resizable: false, alwaysOnTop: true, frame: false, skipTaskbar: false,
+    autoHideMenuBar: true,
+    resizable: !hasLicense,
+    frame: !hasLicense ? true : false,
+    skipTaskbar: false,
+    alwaysOnTop: !!hasLicense,
   });
 
   const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
   win.loadFile(indexPath, { hash: '/app' });
+  if (hasLicense) {
+    applyCompactWindowMode(false);
+  }
   log('WINDOW', 'Created main window');
 }
 
@@ -1064,17 +861,11 @@ Enjoy automating!`,
   try { fs.writeFileSync(settingsPath, JSON.stringify(settings), 'utf-8'); } catch {}
 }
 
-app.whenReady().then(async () => {
-  if (IS_TRIAL) await initializeTrialLock();
-  if (IS_TRIAL && trialState.isExpired) return;
-
+app.whenReady().then(() => {
   const apiLoaded = initWinAPI();
   showFirstRunDialog();
   createWindow();
   registerGlobalHotkeys();
-  if (win) {
-    win.webContents.on('did-finish-load', () => sendTrialStatus());
-  }
   if (!apiLoaded && win) {
     win.webContents.on('did-finish-load', () => { win.webContents.send('api-error', 'Windows API not available.'); });
   }
@@ -1148,10 +939,28 @@ app.whenReady().then(async () => {
   ipcMain.on('set-humanize', (_e, val) => { humanize = val; });
   ipcMain.on('set-start-delay', (_e, val) => { startDelay = val; });
   ipcMain.on('set-expanded', (_e, expanded) => setWindowExpanded(expanded));
-  ipcMain.on('get-trial-status', () => sendTrialStatus());
-  ipcMain.handle('get-trial-status', async () => buildTrialStatusPayload());
   ipcMain.on('minimize', () => { if (win) win.minimize(); });
   ipcMain.on('close-app', () => { if (win) win.close(); });
+  ipcMain.handle('get-build-info', () => ({ variant: 'full' }));
+  ipcMain.handle('license-status', () => getStoredLicenseStatus());
+  ipcMain.handle('activate-license', (_event, licenseKey) => {
+    const result = validateLicenseOnline(licenseKey);
+    if (result.valid) {
+      saveActivatedLicense(String(licenseKey || '').trim(), {
+        licensee: result.licensee || 'Licensed user',
+        issuedAt: result.issuedAt || null,
+        deviceId: getOrCreateDeviceId(),
+      });
+    }
+    return result;
+  });
+  ipcMain.on('license-activated-ui', () => {
+    if (win) {
+      win.close();
+      win = null;
+    }
+    createWindow();
+  });
   ipcMain.on('toggle-pin', () => {
     if (!win) return;
     const pinned = !win.isAlwaysOnTop();
@@ -1167,7 +976,6 @@ app.whenReady().then(async () => {
   ipcMain.on('rename-script', (_e, oldName, newName) => renameScript(oldName, newName));
 
   // Hotkey config IPC
-  ipcMain.handle('get-build-info', () => ({ variant: 'trial' }));
   ipcMain.on('get-hotkeys', () => {
     if (win) win.webContents.send('hotkeys-updated', {
       record: { vk: hotkeyRecord, name: vkToName(hotkeyRecord) },
@@ -1215,7 +1023,7 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (hotkeyPollInterval) clearInterval(hotkeyPollInterval);
-  stopTrialConsumption();
+  try { globalShortcut.unregisterAll(); } catch {}
   if (process.platform !== 'darwin') app.quit();
 });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });

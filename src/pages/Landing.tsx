@@ -18,12 +18,13 @@ import { supabase } from "@/integrations/supabase/client";
 import appScreenshot from "@/assets/app-screenshot.png";
 import loopioLogo from "@/assets/loopio-logo.png";
 
-// ─── GitHub Release page URL ───
-const GITHUB_RELEASE = "https://github.com/jermik/loopio/releases/tag/v1.0.0";
+// ─── URLs ───
+const TRIAL_RELEASE = "https://github.com/jermik/loopio/releases/tag/v1.0.0";
+const POLAR_CHECKOUT = "https://buy.polar.sh/polar_cl_CwGJ1YrTojpJlVucjqX9deR89i3tm1Ex3cm0n47dx9U";
 const DOWNLOAD_URLS = {
-  windows: GITHUB_RELEASE,
-  mac: GITHUB_RELEASE,
-  linux: GITHUB_RELEASE,
+  windows: TRIAL_RELEASE,
+  mac: TRIAL_RELEASE,
+  linux: TRIAL_RELEASE,
 };
 
 // ─── OS detection ───
@@ -294,13 +295,22 @@ export default function Landing() {
                   className="rounded-full px-8 gap-2 text-base font-semibold shadow-lg shadow-primary/20 hover:shadow-primary/30 hover:scale-105 transition-all duration-300"
                 >
                   <Download className="w-5 h-5" />
-                  Download for {OS_LABELS[detectOS()]}
+                  Try Free for {OS_LABELS[detectOS()]}
+                </Button>
+              </a>
+              <a href={POLAR_CHECKOUT} target="_blank" rel="noopener noreferrer">
+                <Button
+                  size="lg"
+                  variant="outline"
+                  className="rounded-full px-8 gap-2 text-base font-semibold border-primary/40 hover:border-primary hover:scale-105 transition-all duration-300"
+                >
+                  Buy Full Version
                 </Button>
               </a>
               <Button
-                variant="outline"
+                variant="ghost"
                 size="lg"
-                className="rounded-full px-8 gap-2 text-base font-medium border-border/60 hover:border-primary/40 hover:scale-105 transition-all duration-300"
+                className="rounded-full px-8 gap-2 text-base font-medium hover:scale-105 transition-all duration-300"
                 onClick={handleWatchDemo}
               >
                 <Play className="w-4 h-4" />
