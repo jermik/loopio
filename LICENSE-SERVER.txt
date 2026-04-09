@@ -1,0 +1,12 @@
+This build is already linked to your Supabase Edge Function:
+https://eoxrjkcnuezgkvqbozdi.supabase.co/functions/v1/validate-license
+
+What you do now:
+1. Build the app:
+   npm install
+   npm run pack:win:full
+2. Sell through Stripe.
+3. Let your backend email the buyer a license key.
+4. Buyer opens MyLoopio and pastes the key.
+
+Note: this build stores the successful activation locally on the buyer device after the first online validation.

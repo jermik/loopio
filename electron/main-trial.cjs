@@ -1,0 +1,1222 @@
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+
+// --- TRIAL MODE ---
+const IS_TRIAL = true;
+const TRIAL_LIMIT_SECONDS = 3600; // 60 minutes
+const TRIAL_SYNC_INTERVAL = 15000; // sync every 15 seconds while playing
+const TRIAL_RPC_LIMIT = TRIAL_LIMIT_SECONDS;
+
+function getTrialPath() {
+  return path.join(app.getPath('appData'), 'MyLoopio', 'trial.json');
+}
+
+function readTrialData() {
+  try {
+    const p = getTrialPath();
+    if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf-8'));
+  } catch {}
+  return null;
+}
+
+function writeTrialData(data) {
+  try {
+    const dir = path.join(app.getPath('appData'), 'MyLoopio');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(getTrialPath(), JSON.stringify(data, null, 2), 'utf-8');
+  } catch (e) {
+    console.error('[Trial] Failed to write trial data:', e);
+  }
+}
+
+function parseEnvFile(content) {
+  const env = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const idx = line.indexOf('=');
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+  return env;
+}
+
+function readRuntimeEnv() {
+  const candidates = [
+    path.join(app.getAppPath(), '.env.production'),
+    path.join(app.getAppPath(), '.env'),
+    path.join(process.cwd(), '.env.production'),
+    path.join(process.cwd(), '.env'),
+  ];
+  const out = { ...process.env };
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) Object.assign(out, parseEnvFile(fs.readFileSync(candidate, 'utf-8')));
+    } catch {}
+  }
+  return out;
+}
+
+function sha(input) {
+  return crypto.createHash('sha256').update(String(input)).digest('hex');
+}
+
+function getWindowsMachineGuid() {
+  try {
+    const stdout = execFileSync('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid'], {
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    const match = stdout.match(/MachineGuid\s+REG_\w+\s+([^\r\n]+)/i);
+    return match?.[1]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function getDeviceId() {
+  const raw = [
+    getWindowsMachineGuid(),
+    process.env.COMPUTERNAME,
+    process.env.USERNAME,
+    process.arch,
+    process.platform,
+  ].filter(Boolean).join('|');
+  return sha(`myloopio-trial-v4|${raw || 'unknown-device'}`);
+}
+
+function getMachineName() {
+  return process.env.COMPUTERNAME || process.env.HOSTNAME || 'unknown-machine';
+}
+
+let trialData = null;
+let trialState = {
+  mode: 'local',
+  initialized: false,
+  deviceId: null,
+  usedSeconds: 0,
+  remainingSeconds: TRIAL_LIMIT_SECONDS,
+  limitSeconds: TRIAL_LIMIT_SECONDS,
+  isExpired: false,
+  pendingIncrement: 0,
+  lastSyncedAt: null,
+  lastError: null,
+};
+let trialTickTimer = null;
+let trialSyncTimer = null;
+let trialLastTickAt = 0;
+
+let win = null;
+let recording = false;
+let playing = false;
+let recordedActions = [];
+let recordStartTime = 0;
+let pollInterval = null;
+let playbackTimeout = null;
+let lastMouseButtons = 0;
+let lastKeyStates = {};
+let lastRecordedPos = { x: -1, y: -1 };
+let playbackSpeed = 1;
+let repeatCount = 0;
+let currentRepeat = 0;
+let humanize = true;
+let startDelay = 0;
+let hotkeyPollInterval = null;
+let lastHotkeyStates = {};
+let playbackAbortFlag = false; // hard abort for instant stop
+
+// Configurable hotkeys (virtual key codes)
+let hotkeyRecord = 0x75; // F6
+let hotkeyPlayStop = 0x76; // F7
+
+// Logging helper
+function log(category, ...args) {
+  const ts = new Date().toISOString().slice(11, 23);
+  console.log(`[${ts}][${category}]`, ...args);
+}
+
+// VK name lookup
+const VK_NAMES = {
+  0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x10: 'Shift', 0x11: 'Ctrl', 0x12: 'Alt',
+  0x14: 'CapsLock', 0x1B: 'Esc', 0x20: 'Space',
+  0x21: 'PgUp', 0x22: 'PgDn', 0x23: 'End', 0x24: 'Home',
+  0x25: '←', 0x26: '↑', 0x27: '→', 0x28: '↓',
+  0x2D: 'Ins', 0x2E: 'Del',
+};
+for (let i = 0x70; i <= 0x87; i++) VK_NAMES[i] = 'F' + (i - 0x70 + 1);
+for (let i = 0x30; i <= 0x39; i++) VK_NAMES[i] = String.fromCharCode(i);
+for (let i = 0x41; i <= 0x5A; i++) VK_NAMES[i] = String.fromCharCode(i);
+
+function vkToName(vk) { return VK_NAMES[vk] || `0x${vk.toString(16).toUpperCase()}`; }
+
+
+function vkToAccelerator(vk) {
+  if (vk >= 0x70 && vk <= 0x87) return `F${vk - 0x70 + 1}`;
+  if (vk >= 0x30 && vk <= 0x39) return String.fromCharCode(vk);
+  if (vk >= 0x41 && vk <= 0x5A) return String.fromCharCode(vk);
+  const map = {
+    0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x1B: 'Escape', 0x20: 'Space',
+    0x21: 'PageUp', 0x22: 'PageDown', 0x23: 'End', 0x24: 'Home',
+    0x25: 'Left', 0x26: 'Up', 0x27: 'Right', 0x28: 'Down',
+    0x2D: 'Insert', 0x2E: 'Delete',
+  };
+  return map[vk] || null;
+}
+
+function handleRecordShortcut() {
+  if (!recording && !playing) {
+    log('HOTKEY', `${vkToName(hotkeyRecord)} → start recording`);
+    startRecording();
+  }
+}
+
+function handlePlayStopShortcut() {
+  if (recording) {
+    log('HOTKEY', `${vkToName(hotkeyPlayStop)} → stop recording + start playback`);
+    stopRecording();
+    startPlayback();
+  } else if (playing) {
+    log('HOTKEY', `${vkToName(hotkeyPlayStop)} → stop playback`);
+    stopPlayback();
+  } else if (recordedActions.length > 0) {
+    log('HOTKEY', `${vkToName(hotkeyPlayStop)} → start playback`);
+    startPlayback();
+  }
+}
+
+function registerGlobalHotkeys() {
+  try { globalShortcut.unregisterAll(); } catch {}
+  const shortcuts = [
+    [vkToAccelerator(hotkeyRecord), handleRecordShortcut],
+    [vkToAccelerator(hotkeyPlayStop), handlePlayStopShortcut],
+  ];
+  for (const [accel, handler] of shortcuts) {
+    if (!accel) continue;
+    try {
+      const ok = globalShortcut.register(accel, handler);
+      log('HOTKEY', `${accel} registration ${ok ? 'ok' : 'failed'}`);
+      if (!ok && win) win.webContents.send('notify', `Hotkey unavailable: ${accel}`);
+    } catch (err) {
+      log('HOTKEY', `Failed to register ${accel}:`, err.message);
+    }
+  }
+}
+
+// --- Script Library ---
+function getLibraryPath() {
+  return path.join(app.getPath('userData'), 'scripts');
+}
+
+function ensureLibraryDir() {
+  const dir = getLibraryPath();
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function listScripts() {
+  const dir = ensureLibraryDir();
+  try {
+    return fs.readdirSync(dir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => {
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf-8'));
+          return { name: f.replace('.json', ''), actions: data.actions?.length || 0, date: fs.statSync(path.join(dir, f)).mtimeMs };
+        } catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.date - a.date);
+  } catch { return []; }
+}
+
+function saveScript(name) {
+  if (recordedActions.length === 0 || !name) return;
+  const dir = ensureLibraryDir();
+  const safeName = name.replace(/[^a-zA-Z0-9_\- ]/g, '').trim();
+  if (!safeName) return;
+  fs.writeFileSync(
+    path.join(dir, safeName + '.json'),
+    JSON.stringify({ actions: recordedActions, version: 2 }, null, 2), 'utf-8'
+  );
+  log('SCRIPT', 'Saved', safeName, recordedActions.length, 'actions');
+  if (win) {
+    win.webContents.send('notify', `Saved "${safeName}"`);
+    win.webContents.send('scripts-updated', listScripts());
+  }
+}
+
+function loadScript(name) {
+  const dir = ensureLibraryDir();
+  const filePath = path.join(dir, name + '.json');
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    if (data.actions && Array.isArray(data.actions)) {
+      recordedActions = data.actions;
+      log('SCRIPT', 'Loaded', name, recordedActions.length, 'actions');
+      if (win) {
+        win.webContents.send('action-count', recordedActions.length);
+        win.webContents.send('notify', `Loaded "${name}"`);
+      }
+    }
+  } catch { if (win) win.webContents.send('notify', 'Failed to load script'); }
+}
+
+function deleteScript(name) {
+  const dir = ensureLibraryDir();
+  try {
+    fs.unlinkSync(path.join(dir, name + '.json'));
+    if (win) {
+      win.webContents.send('notify', `Deleted "${name}"`);
+      win.webContents.send('scripts-updated', listScripts());
+    }
+  } catch { if (win) win.webContents.send('notify', 'Failed to delete'); }
+}
+
+function renameScript(oldName, newName) {
+  const dir = ensureLibraryDir();
+  const safeName = newName.replace(/[^a-zA-Z0-9_\- ]/g, '').trim();
+  if (!safeName || safeName === oldName) return;
+  const oldPath = path.join(dir, oldName + '.json');
+  const newPath = path.join(dir, safeName + '.json');
+  try {
+    if (fs.existsSync(newPath)) { if (win) win.webContents.send('notify', 'Name already exists'); return; }
+    fs.renameSync(oldPath, newPath);
+    if (win) {
+      win.webContents.send('notify', `Renamed to "${safeName}"`);
+      win.webContents.send('scripts-updated', listScripts());
+    }
+  } catch { if (win) win.webContents.send('notify', 'Failed to rename'); }
+}
+
+// --- Humanization helpers ---
+function gaussRand() {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function clampedGauss(mean, stddev, minV, maxV) {
+  return Math.max(minV, Math.min(maxV, mean + gaussRand() * stddev));
+}
+
+function humanizeMove(x, y) {
+  if (!humanize) return { x, y };
+  const jx = Math.round(gaussRand() * 0.7);
+  const jy = Math.round(gaussRand() * 0.7);
+  return { x: x + jx, y: y + jy };
+}
+
+function humanizeDelay() {
+  if (!humanize) return 0;
+  return Math.round(gaussRand() * 3);
+}
+
+function bezierPoint(t, p0, p1, p2, p3) {
+  const u = 1 - t;
+  return u*u*u*p0 + 3*u*u*t*p1 + 3*u*t*t*p2 + t*t*t*p3;
+}
+
+function generateCurvedPath(fromX, fromY, toX, toY, steps) {
+  const dist = Math.sqrt((toX-fromX)**2 + (toY-fromY)**2);
+  if (dist < 3 || steps < 2) return [{ x: toX, y: toY }];
+  const midX = (fromX + toX) / 2;
+  const midY = (fromY + toY) / 2;
+  const perpX = -(toY - fromY) / dist;
+  const perpY = (toX - fromX) / dist;
+  const curvature = clampedGauss(0, dist * 0.08, -dist * 0.15, dist * 0.15);
+  const cp1x = midX + perpX * curvature * 0.6 + gaussRand() * 2;
+  const cp1y = midY + perpY * curvature * 0.6 + gaussRand() * 2;
+  const cp2x = midX + perpX * curvature * 1.2 + gaussRand() * 2;
+  const cp2y = midY + perpY * curvature * 1.2 + gaussRand() * 2;
+  const points = [];
+  for (let i = 1; i <= steps; i++) {
+    let t = i / steps;
+    t = t < 0.5 ? 2*t*t : 1 - Math.pow(-2*t + 2, 2) / 2;
+    const x = Math.round(bezierPoint(t, fromX, cp1x, cp2x, toX));
+    const y = Math.round(bezierPoint(t, fromY, cp1y, cp2y, toY));
+    points.push({ x, y });
+  }
+  return points;
+}
+
+function generateIdleWander(fromX, fromY, toX, toY, availableMs) {
+  if (!humanize) return [];
+  if (availableMs < 500 || Math.random() > 0.35) return [];
+  const moves = [];
+  const numMoves = 1 + Math.floor(Math.random() * 3);
+  const wanderRadius = 5 + Math.random() * 20;
+  const wanderTime = availableMs * 0.7;
+  let curX = fromX, curY = fromY;
+  for (let i = 0; i < numMoves; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * wanderRadius;
+    const wx = Math.round(curX + Math.cos(angle) * dist);
+    const wy = Math.round(curY + Math.sin(angle) * dist);
+    const stepsForDrift = 3 + Math.floor(Math.random() * 5);
+    const curvedPath = generateCurvedPath(curX, curY, wx, wy, stepsForDrift);
+    const stepDelay = Math.floor(wanderTime / (numMoves * stepsForDrift));
+    for (const p of curvedPath) {
+      moves.push({ x: p.x, y: p.y, delay: stepDelay + Math.round(gaussRand() * 5) });
+    }
+    if (Math.random() > 0.5) {
+      const pauseMs = 50 + Math.floor(Math.random() * 150);
+      moves.push({ x: wx, y: wy, delay: pauseMs });
+    }
+    curX = wx;
+    curY = wy;
+  }
+  return moves;
+}
+
+// --- Windows API via koffi ---
+let user32 = null;
+let GetCursorPos = null;
+let SetCursorPos = null;
+let mouse_event_fn = null;
+let GetAsyncKeyState = null;
+let keybd_event_fn = null;
+let POINT = null;
+let SetWindowsHookExW = null;
+let CallNextHookEx = null;
+let UnhookWindowsHookEx = null;
+let scrollHook = null;
+let pendingScrollEvents = [];
+let GetForegroundWindow = null;
+
+function initWinAPI() {
+  try {
+    let koffi;
+    try {
+      koffi = require('koffi');
+    } catch (e1) {
+      const appRoot = path.resolve(__dirname, '..');
+      const koffiPath = path.join(appRoot, 'node_modules', 'koffi');
+      try {
+        koffi = require(koffiPath);
+      } catch (e2) {
+        const resourcesPath = path.join(process.resourcesPath || appRoot, 'node_modules', 'koffi');
+        koffi = require(resourcesPath);
+      }
+    }
+    user32 = koffi.load('user32.dll');
+    POINT = koffi.struct('POINT', { x: 'int32', y: 'int32' });
+    const MSLLHOOKSTRUCT = koffi.struct('MSLLHOOKSTRUCT', {
+      x: 'int32', y: 'int32', mouseData: 'uint32', flags: 'uint32', time: 'uint32', dwExtraInfo: 'uintptr_t'
+    });
+    GetCursorPos = user32.func('bool GetCursorPos(_Out_ POINT* lpPoint)');
+    SetCursorPos = user32.func('bool SetCursorPos(int X, int Y)');
+    mouse_event_fn = user32.func('void mouse_event(uint32 dwFlags, uint32 dx, uint32 dy, uint32 dwData, uintptr_t dwExtraInfo)');
+    GetAsyncKeyState = user32.func('int16 GetAsyncKeyState(int vKey)');
+    keybd_event_fn = user32.func('void keybd_event(uint8 bVk, uint8 bScan, uint32 dwFlags, uintptr_t dwExtraInfo)');
+    GetForegroundWindow = user32.func('intptr_t GetForegroundWindow()');
+
+    // Low-level mouse hook for scroll wheel capture
+    const LowLevelMouseProc = koffi.proto('intptr_t LowLevelMouseProc(int nCode, uintptr_t wParam, MSLLHOOKSTRUCT* lParam)');
+    SetWindowsHookExW = user32.func('intptr_t SetWindowsHookExW(int idHook, LowLevelMouseProc lpfn, intptr_t hMod, uint32 dwThreadId)');
+    CallNextHookEx = user32.func('intptr_t CallNextHookEx(intptr_t hhk, int nCode, uintptr_t wParam, MSLLHOOKSTRUCT* lParam)');
+    UnhookWindowsHookEx = user32.func('bool UnhookWindowsHookEx(intptr_t hhk)');
+
+    const WM_MOUSEWHEEL = 0x020A;
+    const WH_MOUSE_LL = 14;
+
+    const hookCallback = koffi.register((nCode, wParam, lParam) => {
+      if (nCode >= 0 && wParam === WM_MOUSEWHEEL && recording) {
+        const raw = lParam.mouseData >>> 16;
+        const delta = (raw > 32767) ? raw - 65536 : raw;
+        const elapsed = Date.now() - recordStartTime;
+        pendingScrollEvents.push({ type: 'scroll', timestamp: elapsed, x: lParam.x, y: lParam.y, delta });
+      }
+      return CallNextHookEx(scrollHook, nCode, wParam, lParam);
+    }, koffi.pointer(LowLevelMouseProc));
+
+    scrollHook = SetWindowsHookExW(WH_MOUSE_LL, hookCallback, 0, 0);
+
+    log('INIT', 'Windows API loaded successfully');
+    return true;
+  } catch (err) {
+    log('ERROR', 'Failed to load Windows API:', err.message);
+    return false;
+  }
+}
+
+function getMousePos() {
+  if (!GetCursorPos) return { x: 0, y: 0 };
+  const pt = { x: 0, y: 0 };
+  GetCursorPos(pt);
+  return { x: pt.x, y: pt.y };
+}
+function moveMouse(x, y) { if (SetCursorPos) SetCursorPos(x, y); }
+function mouseDown(button) { if (mouse_event_fn) mouse_event_fn(button === 'right' ? 0x0008 : 0x0002, 0, 0, 0, 0); }
+function mouseUp(button) { if (mouse_event_fn) mouse_event_fn(button === 'right' ? 0x0010 : 0x0004, 0, 0, 0, 0); }
+function isKeyPressed(vk) { if (!GetAsyncKeyState) return false; return (GetAsyncKeyState(vk) & 0x8000) !== 0; }
+
+function pressKey(vk) { if (keybd_event_fn) keybd_event_fn(vk, 0, 0, 0); }
+function releaseKey(vk) { if (keybd_event_fn) keybd_event_fn(vk, 0, 0x0002, 0); }
+
+// Check if the foreground window is our app window (to exclude app clicks from recording)
+function isOurWindowFocused() {
+  if (!GetForegroundWindow || !win) return false;
+  try {
+    const fgHwnd = GetForegroundWindow();
+    const ourHwnd = win.getNativeWindowHandle().readInt32LE ? win.getNativeWindowHandle().readInt32LE(0) : 0;
+    return fgHwnd === ourHwnd;
+  } catch {
+    return false;
+  }
+}
+
+const VK_LBUTTON = 0x01, VK_RBUTTON = 0x02, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_L = 0x4C;
+
+const TRACKED_KEYS = [];
+for (let i = 0x41; i <= 0x5A; i++) TRACKED_KEYS.push(i);
+for (let i = 0x30; i <= 0x39; i++) TRACKED_KEYS.push(i);
+for (let i = 0x70; i <= 0x7B; i++) TRACKED_KEYS.push(i);
+const SPECIAL_KEYS = {
+  0x08: 'Backspace', 0x09: 'Tab', 0x0D: 'Enter', 0x10: 'Shift', 0x11: 'Ctrl', 0x12: 'Alt',
+  0x14: 'CapsLock', 0x1B: 'Escape', 0x20: 'Space',
+  0x21: 'PageUp', 0x22: 'PageDown', 0x23: 'End', 0x24: 'Home',
+  0x25: 'Left', 0x26: 'Up', 0x27: 'Right', 0x28: 'Down',
+  0x2D: 'Insert', 0x2E: 'Delete',
+  0x5B: 'LWin', 0x5C: 'RWin',
+  0x60: 'Num0', 0x61: 'Num1', 0x62: 'Num2', 0x63: 'Num3', 0x64: 'Num4',
+  0x65: 'Num5', 0x66: 'Num6', 0x67: 'Num7', 0x68: 'Num8', 0x69: 'Num9',
+  0x6A: 'Num*', 0x6B: 'Num+', 0x6D: 'Num-', 0x6E: 'Num.', 0x6F: 'Num/',
+  0xBA: ';', 0xBB: '=', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/', 0xC0: '`',
+  0xDB: '[', 0xDC: '\\', 0xDD: ']', 0xDE: "'",
+};
+for (const vk of Object.keys(SPECIAL_KEYS)) TRACKED_KEYS.push(parseInt(vk));
+
+function getKeyName(vk) {
+  if (vk >= 0x41 && vk <= 0x5A) return String.fromCharCode(vk);
+  if (vk >= 0x30 && vk <= 0x39) return String.fromCharCode(vk);
+  if (vk >= 0x70 && vk <= 0x7B) return 'F' + (vk - 0x70 + 1);
+  return SPECIAL_KEYS[vk] || `VK_${vk.toString(16)}`;
+}
+
+function startRecording() {
+  if (recording || playing) return;
+  recordedActions = [];
+  recording = true;
+  recordStartTime = Date.now();
+  lastMouseButtons = 0;
+  lastKeyStates = {};
+  lastRecordedPos = { x: -1, y: -1 };
+  log('RECORD', 'Started recording');
+
+  pollInterval = setInterval(() => {
+    if (!recording) return;
+    // Ctrl+Alt emergency stop
+    if (isKeyPressed(VK_CONTROL) && isKeyPressed(VK_MENU)) {
+      log('RECORD', 'Emergency stop (Ctrl+Alt)');
+      stopRecording();
+      if (win) win.webContents.send('state-changed', 'idle');
+      return;
+    }
+
+    const elapsed = Date.now() - recordStartTime;
+    const pos = getMousePos();
+
+    // CRITICAL: Skip recording when our own window is focused (prevents loop-button-click bug)
+    const appFocused = isOurWindowFocused();
+
+    const dx = pos.x - lastRecordedPos.x, dy = pos.y - lastRecordedPos.y;
+    if (dx * dx + dy * dy > 1) {
+      recordedActions.push({ type: 'mousemove', timestamp: elapsed, x: pos.x, y: pos.y });
+      lastRecordedPos = { x: pos.x, y: pos.y };
+    }
+
+    // Only record mouse clicks when NOT clicking on our app
+    if (!appFocused) {
+      const leftDown = isKeyPressed(VK_LBUTTON), wasLeftDown = (lastMouseButtons & 1) !== 0;
+      if (leftDown && !wasLeftDown) recordedActions.push({ type: 'mousedown', timestamp: elapsed, x: pos.x, y: pos.y, button: 'left' });
+      else if (!leftDown && wasLeftDown) recordedActions.push({ type: 'mouseup', timestamp: elapsed, x: pos.x, y: pos.y, button: 'left' });
+      const rightDown = isKeyPressed(VK_RBUTTON), wasRightDown = (lastMouseButtons & 2) !== 0;
+      if (rightDown && !wasRightDown) recordedActions.push({ type: 'mousedown', timestamp: elapsed, x: pos.x, y: pos.y, button: 'right' });
+      else if (!rightDown && wasRightDown) recordedActions.push({ type: 'mouseup', timestamp: elapsed, x: pos.x, y: pos.y, button: 'right' });
+      lastMouseButtons = (leftDown ? 1 : 0) | (rightDown ? 2 : 0);
+    } else {
+      // Track button state even when app focused, so we don't get phantom releases
+      const leftDown = isKeyPressed(VK_LBUTTON);
+      const rightDown = isKeyPressed(VK_RBUTTON);
+      lastMouseButtons = (leftDown ? 1 : 0) | (rightDown ? 2 : 0);
+    }
+
+    for (const vk of TRACKED_KEYS) {
+      if (vk === VK_CONTROL || vk === VK_MENU) continue;
+      // Skip hotkey keys to avoid recording them
+      if (vk === hotkeyRecord || vk === hotkeyPlayStop) continue;
+      const down = isKeyPressed(vk);
+      const wasDown = !!lastKeyStates[vk];
+      if (down && !wasDown) {
+        recordedActions.push({ type: 'keydown', timestamp: elapsed, vk: vk, key: getKeyName(vk) });
+        lastKeyStates[vk] = true;
+      } else if (!down && wasDown) {
+        recordedActions.push({ type: 'keyup', timestamp: elapsed, vk: vk, key: getKeyName(vk) });
+        lastKeyStates[vk] = false;
+      }
+    }
+
+    // Consume scroll events captured by the low-level hook
+    while (pendingScrollEvents.length > 0) {
+      recordedActions.push(pendingScrollEvents.shift());
+    }
+  }, 10);
+
+  if (win) { win.webContents.send('state-changed', 'recording'); win.webContents.send('action-count', 0); }
+}
+
+function stopRecording() {
+  recording = false;
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  lastKeyStates = {};
+  log('RECORD', 'Stopped recording,', recordedActions.length, 'actions captured');
+  if (win) win.webContents.send('action-count', recordedActions.length);
+}
+
+async function startPlayback() {
+  if (recordedActions.length === 0) { log('PLAY', 'No actions to play'); return; }
+  if (playing) return;
+  if (IS_TRIAL && !trialState.initialized) await initializeTrialLock();
+  if (IS_TRIAL && trialState.isExpired) { handleTrialExpired(); return; }
+  playing = true;
+  startTrialConsumption();
+  playbackAbortFlag = false;
+  currentRepeat = 0;
+  log('PLAY', 'Starting playback,', recordedActions.length, 'actions, speed:', playbackSpeed);
+  if (win) win.webContents.send('state-changed', 'playing');
+  if (startDelay > 0) {
+    if (win) win.webContents.send('notify', `Starting in ${startDelay}s...`);
+    let remaining = startDelay;
+    const countdownInterval = setInterval(() => {
+      remaining--;
+      if (!playing || playbackAbortFlag) { clearInterval(countdownInterval); return; }
+      if (remaining <= 0) {
+        clearInterval(countdownInterval);
+        playLoop();
+      } else if (win) {
+        win.webContents.send('notify', `Starting in ${remaining}s...`);
+      }
+    }, 1000);
+  } else {
+    playLoop();
+  }
+}
+
+function sendRepeatStatus() {
+  if (!win) return;
+  const total = repeatCount === 0 ? '∞' : repeatCount;
+  win.webContents.send('repeat-status', { current: currentRepeat + 1, total });
+}
+
+function playLoop() {
+  if (!playing || playbackAbortFlag) return;
+  sendRepeatStatus();
+  const startReal = Date.now();
+  const timingOffset = humanizeDelay();
+  let i = 0;
+
+  const actionTimingOffsets = [];
+  if (humanize) {
+    let drift = 0;
+    for (let j = 0; j < recordedActions.length; j++) {
+      drift += clampedGauss(0, 1.5, -4, 4);
+      drift = Math.max(-8, Math.min(8, drift));
+      actionTimingOffsets.push(Math.round(drift));
+    }
+  } else {
+    for (let j = 0; j < recordedActions.length; j++) actionTimingOffsets.push(0);
+  }
+
+  // Pre-compute idle wander
+  let wanderQueue = [];
+  if (humanize) {
+    let lastPos = recordedActions.length > 0 ? { x: recordedActions[0].x || 0, y: recordedActions[0].y || 0 } : { x: 0, y: 0 };
+    for (let j = 0; j < recordedActions.length; j++) {
+      const a = recordedActions[j];
+      if (a.x != null) lastPos = { x: a.x, y: a.y };
+      if (a.type === 'mousedown' || a.type === 'mouseup') {
+        let prevTime = 0;
+        for (let k = j - 1; k >= 0; k--) {
+          if (recordedActions[k].type !== 'mousemove') { prevTime = recordedActions[k].timestamp; break; }
+        }
+        const gap = a.timestamp - prevTime;
+        if (gap > 500) {
+          const wanders = generateIdleWander(lastPos.x, lastPos.y, a.x, a.y, gap / playbackSpeed);
+          let t = prevTime + 80;
+          for (const w of wanders) {
+            wanderQueue.push({ executeAt: t + timingOffset, x: w.x, y: w.y });
+            t += w.delay;
+          }
+        }
+      }
+    }
+    wanderQueue.sort((a, b) => a.executeAt - b.executeAt);
+  }
+  let wi = 0;
+
+  // Pre-compute curved mouse interpolation
+  let interpQueue = [];
+  if (humanize) {
+    let lastMovePos = null;
+    let lastMoveTime = 0;
+    for (let j = 0; j < recordedActions.length; j++) {
+      const a = recordedActions[j];
+      if (a.type === 'mousemove') {
+        if (lastMovePos) {
+          const dist = Math.sqrt((a.x - lastMovePos.x)**2 + (a.y - lastMovePos.y)**2);
+          if (dist > 15) {
+            const steps = Math.min(8, Math.max(2, Math.floor(dist / 20)));
+            const curved = generateCurvedPath(lastMovePos.x, lastMovePos.y, a.x, a.y, steps);
+            const timeBetween = a.timestamp - lastMoveTime;
+            for (let s = 0; s < curved.length - 1; s++) {
+              const t = lastMoveTime + (timeBetween * (s + 1)) / (curved.length);
+              interpQueue.push({ executeAt: t, x: curved[s].x, y: curved[s].y });
+            }
+          }
+        }
+        lastMovePos = { x: a.x, y: a.y };
+        lastMoveTime = a.timestamp;
+      }
+    }
+    interpQueue.sort((a, b) => a.executeAt - b.executeAt);
+  }
+  let ii = 0;
+
+  function tick() {
+    // CRITICAL: Check abort flag FIRST for instant stop
+    if (!playing || playbackAbortFlag) {
+      log('PLAY', 'Playback tick aborted');
+      return;
+    }
+    if (isKeyPressed(VK_CONTROL) && isKeyPressed(VK_MENU)) { stopPlayback(); return; }
+
+    const elapsed = (Date.now() - startReal) * playbackSpeed;
+
+    // Execute interpolated curve points
+    while (ii < interpQueue.length && interpQueue[ii].executeAt <= elapsed) {
+      if (playbackAbortFlag) return;
+      moveMouse(interpQueue[ii].x, interpQueue[ii].y);
+      ii++;
+    }
+
+    // Execute idle wander movements
+    while (wi < wanderQueue.length && wanderQueue[wi].executeAt <= elapsed) {
+      if (playbackAbortFlag) return;
+      moveMouse(wanderQueue[wi].x, wanderQueue[wi].y);
+      wi++;
+    }
+
+    while (i < recordedActions.length && (recordedActions[i].timestamp + timingOffset + actionTimingOffsets[i]) <= elapsed) {
+      if (playbackAbortFlag) return;
+      const action = recordedActions[i];
+      if (action.type === 'mousemove') {
+        const h = humanizeMove(action.x, action.y);
+        moveMouse(h.x, h.y);
+      } else if (action.type === 'mousedown') {
+        // CLICK FIX: Move to exact position, small settle, then press
+        moveMouse(action.x, action.y);
+        mouseDown(action.button === 'right' ? 'right' : 'left');
+        log('PLAY', 'mousedown', action.button || 'left', 'at', action.x, action.y);
+      } else if (action.type === 'mouseup') {
+        // CLICK FIX: Ensure cursor is at exact same position before release
+        moveMouse(action.x, action.y);
+        mouseUp(action.button === 'right' ? 'right' : 'left');
+        log('PLAY', 'mouseup', action.button || 'left', 'at', action.x, action.y);
+      } else if (action.type === 'scroll' && mouse_event_fn) {
+        moveMouse(action.x, action.y);
+        mouse_event_fn(0x0800, 0, 0, action.delta, 0);
+      } else if (action.type === 'keydown' && action.vk) {
+        pressKey(action.vk);
+        log('PLAY', 'keydown', getKeyName(action.vk));
+      } else if (action.type === 'keyup' && action.vk) {
+        releaseKey(action.vk);
+      }
+      i++;
+    }
+
+    if (i >= recordedActions.length) {
+      currentRepeat++;
+      log('PLAY', 'Loop iteration', currentRepeat, 'complete');
+      if (repeatCount > 0 && currentRepeat >= repeatCount) {
+        stopPlayback();
+        if (win) win.webContents.send('notify', `Finished ${currentRepeat} repeat(s)`);
+      } else if (playing && !playbackAbortFlag) {
+        const loopGap = humanize ? (30 + Math.floor(Math.random() * 170)) : 50;
+        playbackTimeout = setTimeout(playLoop, loopGap);
+      }
+      return;
+    }
+
+    playbackTimeout = setTimeout(tick, 2);
+  }
+  tick();
+}
+
+function stopPlayback() {
+  log('PLAY', 'Stopping playback');
+  playbackAbortFlag = true; // instant abort signal
+  playing = false;
+  stopTrialConsumption();
+  if (playbackTimeout) { clearTimeout(playbackTimeout); playbackTimeout = null; }
+  if (win) win.webContents.send('repeat-status', null);
+  if (win) win.webContents.send('state-changed', 'idle');
+}
+
+function saveRecording() {
+  if (recordedActions.length === 0) return;
+  const result = dialog.showSaveDialogSync(win, {
+    title: 'Save Recording', defaultPath: 'recording.json',
+    filters: [{ name: 'MyLoopio Recording', extensions: ['json'] }],
+  });
+  if (result) {
+    fs.writeFileSync(result, JSON.stringify({ actions: recordedActions, version: 2 }, null, 2), 'utf-8');
+    if (win) win.webContents.send('notify', 'Recording saved');
+  }
+}
+
+function loadRecording() {
+  const result = dialog.showOpenDialogSync(win, {
+    title: 'Load Recording',
+    filters: [{ name: 'MyLoopio Recording', extensions: ['json'] }],
+    properties: ['openFile'],
+  });
+  if (result && result[0]) {
+    try {
+      const data = JSON.parse(fs.readFileSync(result[0], 'utf-8'));
+      if (data.actions && Array.isArray(data.actions)) {
+        recordedActions = data.actions;
+        if (win) { win.webContents.send('action-count', recordedActions.length); win.webContents.send('notify', `Loaded ${recordedActions.length} actions`); }
+      }
+    } catch { if (win) win.webContents.send('notify', 'Failed to load file'); }
+  }
+}
+
+function setWindowExpanded(expanded) {
+  if (!win) return;
+  const bounds = win.getBounds();
+  const h = expanded ? 250 : 50;
+  win.setMinimumSize(280, 40);
+  win.setMaximumSize(400, expanded ? 350 : 50);
+  win.setBounds({ x: bounds.x, y: bounds.y, width: Math.max(bounds.width, 280), height: h });
+}
+
+
+function buildTrialStatusPayload() {
+  return {
+    mode: trialState.mode,
+    initialized: trialState.initialized,
+    deviceId: trialState.deviceId,
+    usedSeconds: Math.max(0, Math.floor(trialState.usedSeconds || 0)),
+    remainingSeconds: Math.max(0, Math.floor(trialState.remainingSeconds || 0)),
+    limitSeconds: Math.max(0, Math.floor(trialState.limitSeconds || TRIAL_LIMIT_SECONDS)),
+    isExpired: !!trialState.isExpired,
+    lastSyncedAt: trialState.lastSyncedAt,
+    lastError: trialState.lastError || null,
+  };
+}
+
+function sendTrialStatus() {
+  if (!win) return;
+  win.webContents.send('trial-status', buildTrialStatusPayload());
+}
+
+async function callTrialRpc(functionName, body) {
+  const env = readRuntimeEnv();
+  const supabaseUrl = env.VITE_SUPABASE_URL || env.SUPABASE_URL;
+  const supabaseAnonKey = env.VITE_SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_PUBLISHABLE_KEY || env.SUPABASE_ANON_KEY;
+  if (!supabaseUrl || !supabaseAnonKey) {
+    throw new Error('Supabase env ontbreekt');
+  }
+  const endpoint = `${supabaseUrl.replace(/\/$/, '')}/rest/v1/rpc/${functionName}`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      apikey: supabaseAnonKey,
+      Authorization: `Bearer ${supabaseAnonKey}`,
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(body),
+  });
+  const responseText = await response.text();
+  if (!response.ok) throw new Error(responseText || `RPC ${functionName} failed (${response.status})`);
+  const json = responseText ? JSON.parse(responseText) : null;
+  return Array.isArray(json) ? json[0] : json;
+}
+
+function applyRemoteTrialState(payload) {
+  if (!payload) return;
+  trialState.mode = 'remote';
+  trialState.initialized = true;
+  trialState.usedSeconds = Math.max(0, Number(payload.used_seconds ?? payload.usedSeconds ?? 0));
+  trialState.limitSeconds = Math.max(1, Number(payload.limit_seconds ?? payload.limitSeconds ?? TRIAL_LIMIT_SECONDS));
+  trialState.remainingSeconds = Math.max(0, Number(payload.remaining_seconds ?? payload.remainingSeconds ?? (trialState.limitSeconds - trialState.usedSeconds)));
+  trialState.isExpired = !!(payload.is_expired ?? payload.isExpired ?? trialState.remainingSeconds <= 0);
+  trialState.lastSyncedAt = new Date().toISOString();
+  trialState.lastError = null;
+  sendTrialStatus();
+}
+
+function applyLocalTrialState() {
+  trialState.mode = 'local';
+  trialState.initialized = true;
+  trialState.usedSeconds = Math.max(0, Number(trialData?.usedTime || 0));
+  trialState.limitSeconds = TRIAL_LIMIT_SECONDS;
+  trialState.remainingSeconds = Math.max(0, TRIAL_LIMIT_SECONDS - trialState.usedSeconds);
+  trialState.isExpired = trialState.remainingSeconds <= 0;
+  sendTrialStatus();
+}
+
+async function ensureRemoteTrialState() {
+  const payload = await callTrialRpc('ensure_trial_lock', {
+    p_device_id: trialState.deviceId,
+    p_machine_name: getMachineName(),
+    p_app_version: app.getVersion(),
+    p_limit_seconds: TRIAL_RPC_LIMIT,
+  });
+  applyRemoteTrialState(payload);
+}
+
+async function consumeRemoteTrialSeconds(increment) {
+  const safeIncrement = Math.max(0, Math.floor(increment || 0));
+  if (safeIncrement <= 0) return buildTrialStatusPayload();
+  const payload = await callTrialRpc('consume_trial_seconds', {
+    p_device_id: trialState.deviceId,
+    p_increment: safeIncrement,
+    p_machine_name: getMachineName(),
+    p_app_version: app.getVersion(),
+    p_limit_seconds: TRIAL_RPC_LIMIT,
+  });
+  applyRemoteTrialState(payload);
+  return buildTrialStatusPayload();
+}
+
+async function flushPendingTrialUsage() {
+  if (trialState.mode === 'remote') {
+    const pending = trialState.pendingIncrement;
+    if (pending <= 0) return;
+    trialState.pendingIncrement = 0;
+    try {
+      await consumeRemoteTrialSeconds(pending);
+    } catch (error) {
+      trialState.pendingIncrement += pending;
+      trialState.lastError = error?.message || String(error);
+      sendTrialStatus();
+      log('TRIAL', 'Remote sync failed:', trialState.lastError);
+    }
+    return;
+  }
+
+  if (trialState.mode === 'local') {
+    trialData = trialData || { firstRun: Date.now(), usedTime: 0 };
+    trialData.usedTime = Math.max(trialData.usedTime || 0, trialState.usedSeconds);
+    writeTrialData(trialData);
+  }
+}
+
+function handleTrialExpired() {
+  stopTrialConsumption();
+  if (playing) stopPlayback();
+  if (win) {
+    dialog.showMessageBox(win, {
+      type: 'warning',
+      title: 'Trial Expired',
+      message: 'Your 60-minute MyLoopio trial has expired. Please purchase a license to continue.',
+      buttons: ['OK']
+    }).then(() => app.quit());
+  } else {
+    app.quit();
+  }
+}
+
+function updateLocalTrialUsage(increment) {
+  const safeIncrement = Math.max(0, Math.floor(increment || 0));
+  if (safeIncrement <= 0) return;
+  trialData = trialData || { firstRun: Date.now(), usedTime: 0 };
+  trialData.usedTime = Math.max(0, Number(trialData.usedTime || 0)) + safeIncrement;
+  trialState.usedSeconds = trialData.usedTime;
+  trialState.remainingSeconds = Math.max(0, TRIAL_LIMIT_SECONDS - trialState.usedSeconds);
+  trialState.isExpired = trialState.remainingSeconds <= 0;
+  writeTrialData(trialData);
+  sendTrialStatus();
+}
+
+function stopTrialConsumption() {
+  if (trialTickTimer) {
+    clearInterval(trialTickTimer);
+    trialTickTimer = null;
+  }
+  if (trialSyncTimer) {
+    clearInterval(trialSyncTimer);
+    trialSyncTimer = null;
+  }
+  trialLastTickAt = 0;
+  flushPendingTrialUsage().catch(() => {});
+}
+
+function startTrialConsumption() {
+  if (!IS_TRIAL || trialState.isExpired || trialTickTimer) return;
+  trialLastTickAt = Date.now();
+  trialTickTimer = setInterval(() => {
+    const now = Date.now();
+    const delta = Math.floor((now - trialLastTickAt) / 1000);
+    if (delta <= 0) return;
+    trialLastTickAt += delta * 1000;
+    trialState.usedSeconds += delta;
+    trialState.remainingSeconds = Math.max(0, trialState.limitSeconds - trialState.usedSeconds);
+    trialState.isExpired = trialState.remainingSeconds <= 0;
+    if (trialState.mode === 'remote') {
+      trialState.pendingIncrement += delta;
+    } else {
+      updateLocalTrialUsage(delta);
+    }
+    sendTrialStatus();
+    if (trialState.isExpired) handleTrialExpired();
+  }, 1000);
+
+  if (trialState.mode === 'remote') {
+    trialSyncTimer = setInterval(() => {
+      flushPendingTrialUsage().catch(() => {});
+    }, TRIAL_SYNC_INTERVAL);
+  }
+}
+
+async function initializeTrialLock() {
+  if (!IS_TRIAL) return;
+  trialState.deviceId = getDeviceId();
+  try {
+    await ensureRemoteTrialState();
+    log('TRIAL', 'Supabase trial lock active for device', trialState.deviceId.slice(0, 12));
+  } catch (error) {
+    trialState.lastError = error?.message || String(error);
+    log('TRIAL', 'Falling back to local trial lock:', trialState.lastError);
+    trialData = readTrialData();
+    if (!trialData) {
+      trialData = { firstRun: Date.now(), usedTime: 0 };
+      writeTrialData(trialData);
+    }
+    applyLocalTrialState();
+  }
+
+  if (trialState.isExpired) {
+    dialog.showMessageBoxSync({
+      type: 'warning',
+      title: 'Trial Expired',
+      message: 'Your 60-minute MyLoopio trial has expired. Please purchase a license to continue.',
+      buttons: ['OK']
+    });
+    app.quit();
+  }
+}
+
+function createWindow() {
+  win = new BrowserWindow({
+    width: 280, height: 50, minWidth: 280, minHeight: 40, maxHeight: 50,
+    title: 'MyLoopio',
+    icon: path.join(__dirname, '..', 'public', 'favicon.ico'),
+    webPreferences: { contextIsolation: true, nodeIntegration: false, webSecurity: false, preload: path.join(__dirname, 'preload.cjs') },
+    backgroundColor: '#0f1318',
+    autoHideMenuBar: true, resizable: false, alwaysOnTop: true, frame: false, skipTaskbar: false,
+  });
+
+  const indexPath = path.join(__dirname, '..', 'dist', 'index.html');
+  win.loadFile(indexPath, { hash: '/app' });
+  log('WINDOW', 'Created main window');
+}
+
+function showFirstRunDialog() {
+  const settingsPath = path.join(app.getPath('userData'), 'settings.json');
+  let settings = {};
+  try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch {}
+  if (settings.firstRunDone) return;
+
+  dialog.showMessageBoxSync({
+    type: 'info',
+    title: 'Welcome to MyLoopio',
+    message: 'Welcome to MyLoopio!',
+    detail:
+`Thank you for trying MyLoopio!
+
+⚠️ WINDOWS SMARTSCREEN
+If Windows showed a "protected your PC" warning, that's normal for unsigned indie apps. The app is 100% safe.
+
+🎮 HOTKEYS (default)
+  F6 = Start/Stop Recording
+  F7 = Play/Stop Playback
+  Ctrl+Alt+L = Loop toggle
+  Ctrl+Alt = Emergency Stop
+
+Enjoy automating!`,
+    buttons: ['Got it!'],
+    defaultId: 0,
+  });
+
+  settings.firstRunDone = true;
+  try { fs.writeFileSync(settingsPath, JSON.stringify(settings), 'utf-8'); } catch {}
+}
+
+app.whenReady().then(async () => {
+  if (IS_TRIAL) await initializeTrialLock();
+  if (IS_TRIAL && trialState.isExpired) return;
+
+  const apiLoaded = initWinAPI();
+  showFirstRunDialog();
+  createWindow();
+  registerGlobalHotkeys();
+  if (win) {
+    win.webContents.on('did-finish-load', () => sendTrialStatus());
+  }
+  if (!apiLoaded && win) {
+    win.webContents.on('did-finish-load', () => { win.webContents.send('api-error', 'Windows API not available.'); });
+  }
+
+  // Global hotkey polling — debounced, reliable, system-wide
+  if (apiLoaded) {
+    let hotkeyDebounce = {}; // prevents double-triggering
+    const DEBOUNCE_MS = 200;
+
+    hotkeyPollInterval = setInterval(() => {
+      const now = Date.now();
+      const recKey = isKeyPressed(hotkeyRecord), wasRec = !!lastHotkeyStates['rec'];
+      const playKey = isKeyPressed(hotkeyPlayStop), wasPlay = !!lastHotkeyStates['play'];
+      const ctrlAltL = isKeyPressed(VK_CONTROL) && isKeyPressed(VK_MENU) && isKeyPressed(VK_L);
+      const wasCtrlAltL = !!lastHotkeyStates['ctrlAltL'];
+      lastHotkeyStates['rec'] = recKey;
+      lastHotkeyStates['play'] = playKey;
+      lastHotkeyStates['ctrlAltL'] = ctrlAltL;
+
+      // F6: Record toggle (only when idle)
+      if (recKey && !wasRec && (now - (hotkeyDebounce['rec'] || 0)) > DEBOUNCE_MS) {
+        hotkeyDebounce['rec'] = now;
+        if (!recording && !playing) {
+          log('HOTKEY', 'F6 → start recording');
+          startRecording();
+        }
+      }
+
+      // F7: Play/Stop toggle
+      if (playKey && !wasPlay && (now - (hotkeyDebounce['play'] || 0)) > DEBOUNCE_MS) {
+        hotkeyDebounce['play'] = now;
+        if (recording) {
+          log('HOTKEY', 'F7 → stop recording + start playback');
+          stopRecording();
+          startPlayback();
+        } else if (playing) {
+          log('HOTKEY', 'F7 → stop playback');
+          stopPlayback();
+        } else if (recordedActions.length > 0) {
+          log('HOTKEY', 'F7 → start playback');
+          startPlayback();
+        }
+      }
+
+      // Ctrl+Alt+L: Loop toggle (stop recording + start loop)
+      if (ctrlAltL && !wasCtrlAltL && (now - (hotkeyDebounce['ctrlAltL'] || 0)) > DEBOUNCE_MS) {
+        hotkeyDebounce['ctrlAltL'] = now;
+        if (recording) {
+          log('HOTKEY', 'Ctrl+Alt+L → stop recording + start loop');
+          stopRecording();
+          startPlayback();
+        } else if (!playing && recordedActions.length > 0) {
+          log('HOTKEY', 'Ctrl+Alt+L → start loop');
+          startPlayback();
+        }
+      }
+    }, 30);
+  }
+
+  ipcMain.on('record', () => { log('IPC', 'record'); startRecording(); });
+  ipcMain.on('stop', () => {
+    log('IPC', 'stop');
+    if (recording) { stopRecording(); if (win) win.webContents.send('state-changed', 'idle'); }
+    if (playing) stopPlayback();
+  });
+  ipcMain.on('loop', () => { log('IPC', 'loop'); stopRecording(); startPlayback(); });
+  ipcMain.on('save', () => saveRecording());
+  ipcMain.on('load', () => loadRecording());
+  ipcMain.on('set-speed', (_e, speed) => { playbackSpeed = speed; });
+  ipcMain.on('set-repeat', (_e, count) => { repeatCount = count; });
+  ipcMain.on('set-humanize', (_e, val) => { humanize = val; });
+  ipcMain.on('set-start-delay', (_e, val) => { startDelay = val; });
+  ipcMain.on('set-expanded', (_e, expanded) => setWindowExpanded(expanded));
+  ipcMain.on('get-trial-status', () => sendTrialStatus());
+  ipcMain.handle('get-trial-status', async () => buildTrialStatusPayload());
+  ipcMain.on('minimize', () => { if (win) win.minimize(); });
+  ipcMain.on('close-app', () => { if (win) win.close(); });
+  ipcMain.on('toggle-pin', () => {
+    if (!win) return;
+    const pinned = !win.isAlwaysOnTop();
+    win.setAlwaysOnTop(pinned);
+    win.webContents.send('pin-changed', pinned);
+  });
+
+  // Script library IPC
+  ipcMain.on('get-scripts', () => { if (win) win.webContents.send('scripts-updated', listScripts()); });
+  ipcMain.on('save-script', (_e, name) => saveScript(name));
+  ipcMain.on('load-script', (_e, name) => loadScript(name));
+  ipcMain.on('delete-script', (_e, name) => deleteScript(name));
+  ipcMain.on('rename-script', (_e, oldName, newName) => renameScript(oldName, newName));
+
+  // Hotkey config IPC
+  ipcMain.handle('get-build-info', () => ({ variant: 'trial' }));
+  ipcMain.on('get-hotkeys', () => {
+    if (win) win.webContents.send('hotkeys-updated', {
+      record: { vk: hotkeyRecord, name: vkToName(hotkeyRecord) },
+      playStop: { vk: hotkeyPlayStop, name: vkToName(hotkeyPlayStop) },
+    });
+  });
+  ipcMain.on('set-hotkey', (_e, which, vk) => {
+    if (which === 'record') hotkeyRecord = vk;
+    else if (which === 'playStop') hotkeyPlayStop = vk;
+    registerGlobalHotkeys();
+    if (win) win.webContents.send('hotkeys-updated', {
+      record: { vk: hotkeyRecord, name: vkToName(hotkeyRecord) },
+      playStop: { vk: hotkeyPlayStop, name: vkToName(hotkeyPlayStop) },
+    });
+  });
+
+  // Capture next key press
+  let captureInterval = null;
+  ipcMain.on('capture-hotkey', (_e, which) => {
+    if (captureInterval) clearInterval(captureInterval);
+    captureInterval = setInterval(() => {
+      for (let vk = 0x08; vk <= 0x87; vk++) {
+        if (vk === 0x11 || vk === 0x12) continue;
+        if (isKeyPressed(vk)) {
+          clearInterval(captureInterval);
+          captureInterval = null;
+          if (which === 'record') hotkeyRecord = vk;
+          else if (which === 'playStop') hotkeyPlayStop = vk;
+          registerGlobalHotkeys();
+          if (win) {
+            win.webContents.send('hotkeys-updated', {
+              record: { vk: hotkeyRecord, name: vkToName(hotkeyRecord) },
+              playStop: { vk: hotkeyPlayStop, name: vkToName(hotkeyPlayStop) },
+            });
+            win.webContents.send('hotkey-captured', which);
+          }
+          return;
+        }
+      }
+    }, 30);
+    setTimeout(() => { if (captureInterval) { clearInterval(captureInterval); captureInterval = null; if (win) win.webContents.send('hotkey-captured', null); } }, 5000);
+  });
+  ipcMain.on('cancel-capture', () => { if (captureInterval) { clearInterval(captureInterval); captureInterval = null; } });
+});
+
+app.on('window-all-closed', () => {
+  if (hotkeyPollInterval) clearInterval(hotkeyPollInterval);
+  stopTrialConsumption();
+  if (process.platform !== 'darwin') app.quit();
+});
+app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+app.on('will-quit', () => { try { globalShortcut.unregisterAll(); } catch {} });

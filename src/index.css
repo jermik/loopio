@@ -1,0 +1,110 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    scroll-behavior: smooth;
+    --background: 220 20% 7%;
+    --foreground: 210 20% 90%;
+
+    --card: 220 18% 10%;
+    --card-foreground: 210 20% 90%;
+
+    --popover: 220 18% 12%;
+    --popover-foreground: 210 20% 90%;
+
+    --primary: 152 68% 50%;
+    --primary-foreground: 220 20% 7%;
+
+    --secondary: 220 16% 16%;
+    --secondary-foreground: 210 20% 80%;
+
+    --muted: 220 14% 14%;
+    --muted-foreground: 215 12% 50%;
+
+    --accent: 152 68% 50%;
+    --accent-foreground: 220 20% 7%;
+
+    --destructive: 0 72% 56%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 14% 18%;
+    --input: 220 14% 18%;
+    --ring: 152 68% 50%;
+
+    --radius: 0.75rem;
+
+    --recording: 0 72% 56%;
+    --recording-foreground: 0 0% 100%;
+    --playing: 152 68% 50%;
+    --playing-foreground: 220 20% 7%;
+    --idle: 220 10% 40%;
+    --idle-foreground: 210 20% 80%;
+
+    --surface-glow: 152 68% 50%;
+
+    --sidebar-background: 220 18% 10%;
+    --sidebar-foreground: 210 20% 80%;
+    --sidebar-primary: 152 68% 50%;
+    --sidebar-primary-foreground: 220 20% 7%;
+    --sidebar-accent: 220 14% 14%;
+    --sidebar-accent-foreground: 210 20% 80%;
+    --sidebar-border: 220 14% 18%;
+    --sidebar-ring: 152 68% 50%;
+
+    font-family: 'Space Grotesk', sans-serif;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: 'Space Grotesk', sans-serif;
+  }
+
+  code, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@layer utilities {
+  .glow-green {
+    box-shadow: 0 0 20px hsl(var(--playing) / 0.3), 0 0 60px hsl(var(--playing) / 0.1);
+  }
+  .glow-red {
+    box-shadow: 0 0 20px hsl(var(--recording) / 0.3), 0 0 60px hsl(var(--recording) / 0.1);
+  }
+  .glass {
+    background: hsl(var(--card) / 0.6);
+    backdrop-filter: blur(12px);
+    border: 1px solid hsl(var(--border) / 0.5);
+  }
+}
+
+/* Prevent cursor changes from interfering with mouse automation */
+*:disabled,
+*[disabled],
+button:disabled,
+button[disabled] {
+  cursor: default !important;
+  pointer-events: auto !important;
+}
+
+* {
+  cursor: revert;
+}
+
+*:not(:disabled):not([disabled]) {
+  cursor: default;
+}
+
+a, button:not(:disabled), [role="button"]:not(:disabled), input[type="submit"]:not(:disabled) {
+  cursor: pointer !important;
+}

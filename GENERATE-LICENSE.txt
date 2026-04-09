@@ -1,0 +1,3 @@
+Generate one license key with:
+
+node scripts/generate-license.cjs "buyer@email.com" "ORDER-1001"

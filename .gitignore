@@ -1,0 +1,16 @@
+node_modules/
+dist/
+release/
+trial-extracted/
+
+# Private key - never commit this
+private/
+
+# Env files
+.env
+.env.production
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db

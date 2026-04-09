@@ -1,0 +1,70 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: windows-trial
+            build_script: pack:win:trial
+          - os: windows-latest
+            artifact_name: windows-full
+            build_script: pack:win:full
+          - os: ubuntu-latest
+            artifact_name: linux-trial
+            build_script: pack:linux:trial
+          - os: ubuntu-latest
+            artifact_name: linux-full
+            build_script: pack:linux:full
+          - os: macos-latest
+            artifact_name: macos-trial
+            build_script: pack:mac:trial
+          - os: macos-latest
+            artifact_name: macos-full
+            build_script: pack:mac:full
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build app
+        run: npm run ${{ matrix.build_script }}
+
+      - name: Zip release folder
+        shell: bash
+        run: |
+          cd release
+          TARGET_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          if [ -z "$TARGET_DIR" ]; then
+            echo "No release directory found"
+            exit 1
+          fi
+          base=$(basename "$TARGET_DIR")
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            powershell -Command "Compress-Archive -Path $base -DestinationPath $base.zip -Force"
+          else
+            zip -r "$base.zip" "$base"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: release/*.zip
